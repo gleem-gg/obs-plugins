@@ -43,8 +43,8 @@ esac
 
 # The runtime has to be the one the plugin is built for. The SDK image is
 # tagged by its ABI, so only the runtime can be the wrong one.
-runtime_abi="$("$engine" image inspect --format '{{ index .Labels "gg.gleem.obs-abi" }}' "$runtime" 2>/dev/null \
-    || { "$engine" pull -q "$runtime" >/dev/null && "$engine" image inspect --format '{{ index .Labels "gg.gleem.obs-abi" }}' "$runtime"; })"
+runtime_abi="$("$engine" image inspect --format '{{ index .Config.Labels "gg.gleem.obs-abi" }}' "$runtime" 2>/dev/null \
+    || { "$engine" pull -q "$runtime" >/dev/null && "$engine" image inspect --format '{{ index .Config.Labels "gg.gleem.obs-abi" }}' "$runtime"; })"
 if [ "$runtime_abi" != "$abi" ]; then
     echo "${runtime} is built for '${runtime_abi}', not ${abi}" >&2
     exit 1
