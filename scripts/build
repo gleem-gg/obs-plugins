@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# Build one catalog plugin for one ABI and package it.
+#
+#   scripts/build <abi> <recipe.json> [out-dir]
+#
+# Compiles the plugin inside ghcr.io/gleem-gg/obs-runtime-sdk:<abi>, the very
+# OBS build rentals run (the `obs` stage of gleem-gg/obs-runtime), so it links
+# against exactly that libobs. Then checks it in the runtime image itself:
+# every library it needs has to be there, since rentals cannot install any.
+#
+# Writes <out-dir>/<id>-<version>.tar.zst, laid out the way the agent mounts it
+# at /opt/gleem/obs-plugins/<module> in a rental:
+#
+#   bin/<module>.so
+#   data/...        the plugin's locale, effects and so on (may be empty)
+#   LICENSE
+#
+# and <out-dir>/<id>-<version>.json with the catalog entry, less the URL.
+#
+# CONTAINER picks the engine (podman by default). SDK_IMAGE and RUNTIME_IMAGE
+# override the images, e.g. to test against a local build.
+set -euo pipefail
+
+abi="${1:?abi key, e.g. obs-32.2.2-trixie}"
+recipe="${2:?recipe json}"
+out="${3:-dist/${abi}}"
+
+engine="${CONTAINER:-podman}"
+sdk="${SDK_IMAGE:-ghcr.io/gleem-gg/obs-runtime-sdk:${abi}}"
+runtime="${RUNTIME_IMAGE:-ghcr.io/gleem-gg/obs-runtime:latest}"
+
+field() { jq -er "$1" "$recipe"; }
+id="$(field .id)"
+version="$(field .version)-$(field .revision)"
+repo="$(field .repo)"
+commit="$(field .commit)"
+mapfile -t cmake_args < <(jq -r '.cmake[]' "$recipe")
+
+case "$id" in
+    *[!a-z0-9-]*|'') echo "bad id: ${id}" >&2; exit 1 ;;
+esac
+
+# The runtime has to be the one the plugin is built for. The SDK image is
+# tagged by its ABI, so only the runtime can be the wrong one.
+runtime_abi="$("$engine" image inspect --format '{{ index .Labels "gg.gleem.obs-abi" }}' "$runtime" 2>/dev/null \
+    || { "$engine" pull -q "$runtime" >/dev/null && "$engine" image inspect --format '{{ index .Labels "gg.gleem.obs-abi" }}' "$runtime"; })"
+if [ "$runtime_abi" != "$abi" ]; then
+    echo "${runtime} is built for '${runtime_abi}', not ${abi}" >&2
+    exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/out" "$out"
+
+echo "Building ${id} ${version} for ${abi}"
+# /src in the SDK holds OBS's own source, which the plugin builds use.
+"$engine" run --rm -v "$work/out:/out:Z" "$sdk" bash -euo pipefail -c '
+    repo="$1" commit="$2"; shift 2
+    git clone --quiet "$repo" /plugin
+    git -C /plugin checkout --quiet --detach "$commit"
+    git -C /plugin submodule update --quiet --init --recursive --depth 1
+    cmake -S /plugin -B /plugin-build -G Ninja -Wno-dev \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
+        "$@" >/dev/null
+    cmake --build /plugin-build
+    DESTDIR=/out/install cmake --install /plugin-build >/dev/null
+    find /out/install -name "*.so" -exec strip --strip-unneeded {} +
+    cp /plugin/LICENSE* /plugin/COPYING* /out/ 2>/dev/null || true
+    chown -R "$(stat -c %u:%g /out)" /out
+' build "$repo" "$commit" "${cmake_args[@]}"
+
+# One module per plugin. Its name is the .so's, which is what OBS calls it.
+# Copies of the OBS plugin template install the same file twice (under
+# lib/obs-plugins and obs-plugins/64bit), so names are counted, not files.
+mapfile -t modules < <(find "$work/out/install" -path '*/obs-plugins/*.so' -printf '%f\n' | sort -u)
+if [ "${#modules[@]}" -ne 1 ]; then
+    echo "expected one plugin module, found: ${modules[*]:-none}" >&2
+    exit 1
+fi
+module="${modules[0]%.so}"
+case "$module" in
+    *[!A-Za-z0-9_-]*) echo "module name ${module} cannot be mounted" >&2; exit 1 ;;
+esac
+
+stage="$work/stage"
+mkdir -p "$stage/bin" "$stage/data"
+cp "$(find "$work/out/install" -path "*/obs-plugins/${module}.so" -print -quit)" "$stage/bin/"
+# Data lands under share/obs/obs-plugins/<module> with OBS's own CMake, and
+# under data/obs-plugins/<module> with older copies of the plugin template.
+for data in "$work/out/install/usr/share/obs/obs-plugins/${module}" "$work/out/install/usr/data/obs-plugins/${module}"; do
+    if [ -d "$data" ]; then
+        cp -r "$data/." "$stage/data/"
+    fi
+done
+license="$(find "$work/out" -maxdepth 1 \( -name 'LICENSE*' -o -name 'COPYING*' \) | head -n1)"
+[ -n "$license" ] || { echo "the plugin's source has no LICENSE or COPYING" >&2; exit 1; }
+cp "$license" "$stage/LICENSE"
+
+echo "Checking ${module} against ${runtime}"
+missing="$("$engine" run --rm --entrypoint /bin/sh -v "$stage:/plugin:ro,Z" "$runtime" \
+    -c "ldd /plugin/bin/${module}.so" | grep 'not found' || true)"
+if [ -n "$missing" ]; then
+    echo "${module}.so needs libraries the runtime does not have:" >&2
+    echo "$missing" >&2
+    exit 1
+fi
+
+file="${id}-${version}.tar.zst"
+# Reproducible apart from the compiler: sorted, no owners, no timestamps.
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+    --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - . | zstd -19 -q -o "$out/$file" -f
+sha256="$(sha256sum "$out/$file" | cut -d' ' -f1)"
+size="$(stat -c %s "$out/$file")"
+
+jq -n --slurpfile r "$recipe" \
+    --arg version "$version" --arg module "$module" --arg file "$file" \
+    --arg sha256 "$sha256" --argjson size "$size" '
+    $r[0] | {
+        id, name, description, version: $version, module: $module,
+        license, homepage, source: { repo, commit },
+        file: $file, sha256: $sha256, size: $size
+    }' > "$out/${id}-${version}.json"
+
+echo "  ${out}/${file} (${size} bytes, module ${module})"

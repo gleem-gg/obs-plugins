@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# Write the catalog index for one ABI from the entries scripts/build wrote.
+#
+#   scripts/index <abi> <serial> [dist-dir]
+#
+# Writes <dist-dir>/index-<serial>.json: every recipe in recipes/, at the
+# version that recipe names now, with the URL it is published at. The serial
+# orders indexes (a UTC timestamp, YYYYMMDDHHMMSS); CI signs the index with
+# the trusted comment "obs-plugins <abi> <serial>" and publishes the serial
+# as <abi>/latest, which is what the control plane reads first.
+set -euo pipefail
+
+abi="${1:?abi key}"
+serial="${2:?serial}"
+dist="${3:-dist/${abi}}"
+base="${BASE_URL:-https://get.gleem.gg/obs-plugins}"
+
+case "$serial" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *) echo "serial must be YYYYMMDDHHMMSS, got ${serial}" >&2; exit 1 ;;
+esac
+
+entries=()
+for recipe in recipes/*.json; do
+    id="$(jq -er .id "$recipe")"
+    version="$(jq -er .version "$recipe")-$(jq -er .revision "$recipe")"
+    entry="${dist}/${id}-${version}.json"
+    [ -f "$entry" ] || { echo "${entry} is missing; build ${id} first" >&2; exit 1; }
+    entries+=("$entry")
+done
+
+jq -s --arg abi "$abi" --arg serial "$serial" --arg base "$base" '{
+    abi: $abi,
+    serial: $serial,
+    plugins: (map(. + { url: "\($base)/\($abi)/\(.id)/\(.version)/\(.file)" } | del(.file)) | sort_by(.id))
+}' "${entries[@]}" > "${dist}/index-${serial}.json"
+
+echo "${dist}/index-${serial}.json"

@@ -1,0 +1,12 @@
+{
+  "id": "advanced-masks",
+  "name": "Advanced Masks",
+  "description": "Shape, gradient and source masks with feathering, as a filter on any source.",
+  "version": "1.5.4",
+  "revision": 1,
+  "repo": "https://github.com/FiniteSingularity/obs-advanced-masks.git",
+  "commit": "63f2eae2f9f174d781f4a127b66e878760430532",
+  "license": "GPL-2.0",
+  "homepage": "https://obsproject.com/forum/resources/advanced-masks.1856/",
+  "cmake": []
+}

@@ -1,0 +1,12 @@
+{
+  "id": "composite-blur",
+  "name": "Composite Blur",
+  "description": "Gaussian, box, dual Kawase, pixelate and motion blurs, with masks, as a filter on any source.",
+  "version": "1.5.2",
+  "revision": 1,
+  "repo": "https://github.com/FiniteSingularity/obs-composite-blur.git",
+  "commit": "160f7ad4d464e85e24894187244cf71a3913aea9",
+  "license": "GPL-2.0",
+  "homepage": "https://obsproject.com/forum/resources/composite-blur.1780/",
+  "cmake": ["-DLINUX_PORTABLE=off"]
+}

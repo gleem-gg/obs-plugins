@@ -1,0 +1,12 @@
+{
+  "id": "source-clone",
+  "name": "Source Clone",
+  "description": "Shows another source, scene or the program output again, with its own filters.",
+  "version": "0.2.3",
+  "revision": 1,
+  "repo": "https://github.com/exeldro/obs-source-clone.git",
+  "commit": "e5ca9dd25229fdf1f1b8c6fa83762c0581c18c92",
+  "license": "GPL-2.0",
+  "homepage": "https://obsproject.com/forum/resources/source-clone.1632/",
+  "cmake": ["-DBUILD_OUT_OF_TREE=On"]
+}

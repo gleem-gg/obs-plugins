@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# Build what is missing for one ABI and publish its catalog to get.gleem.gg
+# (Bunny storage zone gleem-cli, behind pull zone gleem-cli).
+#
+#   BUNNY_STORAGE_PASSWORD=... MINISIGN_SECRET_KEY=... MINISIGN_PASSWORD=... \
+#       scripts/publish <abi>
+#
+# Lays out
+#
+#   /obs-plugins/<abi>/<id>/<version>/<id>-<version>.tar.zst   never changed again
+#   /obs-plugins/<abi>/<id>/<version>/<id>-<version>.json      its catalog entry
+#   /obs-plugins/<abi>/index-<serial>.json (+ .minisig)        never changed again
+#   /obs-plugins/<abi>/latest                                  "<serial>", written last
+#
+# A plugin version already published is not rebuilt: its entry is downloaded
+# instead, so the index keeps the hash of the file that is actually served.
+# Builds are not bit-for-bit reproducible, and the CDN keeps version folders
+# for 30 days, so a published file is never replaced. Change a recipe's
+# revision to ship a rebuild. `latest` is cached for 60 seconds at the edge
+# (the */latest rule on the pull zone), every other file for 30 days, which is
+# why nothing but `latest` is ever overwritten.
+set -euo pipefail
+
+abi="${1:?abi key}"
+: "${BUNNY_STORAGE_PASSWORD:?the gleem-cli storage zone password}"
+: "${MINISIGN_SECRET_KEY:?}" "${MINISIGN_PASSWORD:?}"
+zone="${BUNNY_STORAGE_ZONE:-gleem-cli}"
+host="${BUNNY_STORAGE_HOST:-storage.bunnycdn.com}"
+base="https://${host}/${zone}/obs-plugins/${abi}"
+dist="dist/${abi}"
+mkdir -p "$dist"
+
+put() {
+    local file="$1" path="$2" sum
+    # Bunny rejects the upload if the body does not hash to this, so a
+    # truncated transfer fails here instead of being served.
+    sum="$(sha256sum "$file" | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+    curl -fsS --retry 3 -X PUT \
+        -H "AccessKey: ${BUNNY_STORAGE_PASSWORD}" \
+        -H "Checksum: ${sum}" \
+        -H 'Content-Type: application/octet-stream' \
+        --data-binary "@${file}" \
+        "${base}/${path}" >/dev/null
+    echo "  obs-plugins/${abi}/${path}"
+}
+
+for recipe in recipes/*.json; do
+    id="$(jq -er .id "$recipe")"
+    version="$(jq -er .version "$recipe")-$(jq -er .revision "$recipe")"
+    entry="${id}-${version}.json"
+    status="$(curl -sS -o "${dist}/${entry}" -w '%{http_code}' \
+        -H "AccessKey: ${BUNNY_STORAGE_PASSWORD}" "${base}/${id}/${version}/${entry}")"
+    if [ "$status" = 200 ]; then
+        echo "${id} ${version} is already published"
+        continue
+    fi
+    rm -f "${dist}/${entry}"
+    scripts/build "$abi" "$recipe" "$dist"
+    put "${dist}/$(jq -er .file "${dist}/${entry}")" "${id}/${version}/$(jq -er .file "${dist}/${entry}")"
+    put "${dist}/${entry}" "${id}/${version}/${entry}"
+done
+
+serial="$(date -u +%Y%m%d%H%M%S)"
+index="$(scripts/index "$abi" "$serial" "$dist")"
+
+# The trusted comment names ABI and serial, and the control plane insists on
+# an exact match with what it asked for, so an index cannot be served under
+# another ABI or passed off as a newer one. Verifying against the committed
+# key catches a wrong secret before anything is published.
+key="$(mktemp)"
+trap 'rm -f "$key"' EXIT
+printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$index" -t "obs-plugins ${abi} ${serial}" >/dev/null
+minisign -V -q -p packaging/minisign.pub -m "$index"
+
+put "$index" "index-${serial}.json"
+put "${index}.minisig" "index-${serial}.json.minisig"
+pointer="$(mktemp)"
+printf '%s\n' "$serial" > "$pointer"
+put "$pointer" latest
+rm -f "$pointer"
